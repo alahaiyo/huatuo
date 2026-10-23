@@ -25,8 +25,8 @@ import (
 
 	"github.com/ccfos/huatuo/internal/cgroups"
 	"github.com/ccfos/huatuo/internal/cgroups/stats"
+	"github.com/ccfos/huatuo/internal/matcher"
 	"github.com/ccfos/huatuo/internal/pod"
-	"github.com/ccfos/huatuo/internal/timeutil"
 	"github.com/ccfos/huatuo/internal/utils/cpuutil"
 )
 
@@ -81,8 +81,8 @@ func TestNewCPUIdleTracingBindsConfig(t *testing.T) {
 	if tracer.minTraceInterval != 300*time.Second {
 		t.Errorf("minTraceInterval = %s, want 5m0s", tracer.minTraceInterval)
 	}
-	if tracer.perfDuration != 7*time.Second {
-		t.Errorf("perfDuration = %s, want 7s", tracer.perfDuration)
+	if tracer.traceDuration != 7*time.Second {
+		t.Errorf("traceDuration = %s, want 7s", tracer.traceDuration)
 	}
 	if tracer.threshold.percent != (cpuUsageBreakdown[int64]{user: 75, system: 45, total: 90}) {
 		t.Errorf("percent threshold = %+v, want user=75 system=45 total=90", tracer.threshold.percent)
@@ -113,7 +113,7 @@ func TestValidateCPUIdleConfig(t *testing.T) {
 			config: cpuTracingConfig{
 				intervalSeconds:         10,
 				minTraceIntervalSeconds: 1800,
-				perfDurationSeconds:     10,
+				traceDurationSeconds:    10,
 				systemThreshold:         45,
 				systemDeltaThreshold:    20,
 			},
@@ -124,7 +124,7 @@ func TestValidateCPUIdleConfig(t *testing.T) {
 			config: cpuTracingConfig{
 				intervalSeconds:         10,
 				minTraceIntervalSeconds: 1800,
-				perfDurationSeconds:     10,
+				traceDurationSeconds:    10,
 			},
 			threshold: cpuIdleThreshold{
 				percent: cpuUsageBreakdown[int64]{user: -1},
@@ -136,7 +136,7 @@ func TestValidateCPUIdleConfig(t *testing.T) {
 			config: cpuTracingConfig{
 				intervalSeconds:         10,
 				minTraceIntervalSeconds: 1800,
-				perfDurationSeconds:     10,
+				traceDurationSeconds:    10,
 			},
 			threshold: cpuIdleThreshold{
 				delta: cpuUsageBreakdown[int64]{total: 101},
@@ -152,7 +152,7 @@ func TestValidateCPUIdleConfig(t *testing.T) {
 			err := validateCPUIdleConfig(
 				tt.config.intervalSeconds,
 				tt.config.minTraceIntervalSeconds,
-				tt.config.perfDurationSeconds,
+				tt.config.traceDurationSeconds,
 				tt.threshold,
 			)
 			if tt.wantError == "" {
@@ -373,6 +373,7 @@ func TestCPUIdleTracingReconcileContainerStates(t *testing.T) {
 	tracer.reconcileContainerStates(map[string]*pod.Container{
 		"keep": {
 			ID:         "keep",
+			Type:       pod.ContainerTypeNormal,
 			CgroupPath: "new",
 		},
 	})
@@ -589,16 +590,122 @@ func TestCPUIdleTracingDataJSON(t *testing.T) {
 	}
 }
 
-func TestSaveCPUIdleTraceRejectsInvalidPerfOutput(t *testing.T) {
-	t.Parallel()
+func TestCPUIdleKataSharedState(t *testing.T) {
+	tracer := &cpuIdleTracing{containers: make(map[string]*containerCPUState)}
+	first := &pod.Container{
+		ID:          "z-first",
+		Type:        pod.ContainerTypeNormal,
+		RuntimeType: "io.containerd.kata-qemu.v2",
+		SandboxID:   "vm",
+		SyncedAt:    time.Unix(1, 0),
+		CgroupPath:  "/kata/vm",
+		CgroupCss:   map[string]uint64{"cpu": 10},
+	}
+	second := *first
+	second.ID = "a-second"
+	second.SyncedAt = time.Unix(2, 0)
+	members := map[string]*pod.Container{
+		first.ID:  first,
+		second.ID: &second,
+		"runc":    {ID: "runc", Type: pod.ContainerTypeNormal, CgroupPath: "/runc"},
+		"guest":   {ID: "guest", Type: pod.ContainerTypeNormal, CgroupPath: "/guest"},
+	}
+	tracer.reconcileContainerStates(members)
+	state := tracer.containers["kata:vm"]
+	if len(tracer.containers) != 3 || state == nil || state.containerID != first.ID {
+		t.Fatalf("unexpected shared state: %+v", tracer.containers)
+	}
+	state.previousUsage.total = 123
+	state.hasUsage = true
+	state.lastTraceAt = time.Unix(100, 0)
+	for range 100 {
+		tracer.reconcileContainerStates(members)
+		if tracer.containers["kata:vm"] != state || state.containerID != first.ID {
+			t.Fatal("representative is not stable")
+		}
+	}
+	delete(members, first.ID)
+	tracer.reconcileContainerStates(members)
+	if tracer.containers["kata:vm"] != state ||
+		state.containerID != second.ID ||
+		state.previousUsage.total != 123 ||
+		!state.hasUsage ||
+		!state.lastTraceAt.Equal(
+			time.Unix(100, 0),
+		) {
+		t.Errorf("representative handoff reset shared measurements: %+v", state)
+	}
+	second.CgroupCss = map[string]uint64{"cpu": 11}
+	tracer.reconcileContainerStates(members)
+	if state.hasUsage || state.previousUsage.total != 0 || !state.lastTraceAt.Equal(time.Unix(100, 0)) {
+		t.Errorf("VM replacement must reset baseline and keep cooldown: %+v", state)
+	}
+	second.SandboxID = "new-vm"
+	tracer.reconcileContainerStates(members)
+	if tracer.containers["kata:vm"] != nil ||
+		tracer.containers["kata:new-vm"] == nil ||
+		!tracer.containers["kata:new-vm"].lastTraceAt.IsZero() {
+		t.Error("new sandbox reused old cooldown")
+	}
+	second.CgroupCss = nil
+	tracer.reconcileContainerStates(members)
+	if state := tracer.containers["kata:new-vm"]; state == nil || state.containerID != "" || state.hasUsage {
+		t.Error("Kata without CPU CSS must retain only its VM lifetime state")
+	}
+}
 
-	tracer := &cpuIdleTracing{}
-	err := tracer.saveCPUIdleTrace(
-		&containerCPUState{},
-		timeutil.Timestamp{Time: time.Unix(100, 0)},
-		[]byte("not-json"),
-	)
-	if err == nil || !strings.Contains(err.Error(), "decode container perf output") {
-		t.Fatalf("saveCPUIdleTrace() error = %v, want decode error", err)
+func TestCPUIdleKataRepresentativeRespectsFilter(t *testing.T) {
+	config := &ContainerFilterConfig{
+		Excluded: []*matcher.Rule{{Field: matcher.FieldTypeContainerHostname, Pattern: "^excluded$"}},
+	}
+	filter, err := config.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracer := &cpuIdleTracing{filter: filter, containers: make(map[string]*containerCPUState)}
+	tracer.reconcileContainerStates(map[string]*pod.Container{
+		"first": {
+			ID:          "first",
+			Type:        pod.ContainerTypeNormal,
+			Hostname:    "excluded",
+			RuntimeType: "io.containerd.kata.v2",
+			SandboxID:   "vm",
+			SyncedAt:    time.Unix(1, 0),
+			CgroupCss:   map[string]uint64{"cpu": 10},
+		},
+		"second": {
+			ID:          "second",
+			Type:        pod.ContainerTypeNormal,
+			Hostname:    "included",
+			RuntimeType: "io.containerd.kata.v2",
+			SandboxID:   "vm",
+			SyncedAt:    time.Unix(2, 0),
+			CgroupCss:   map[string]uint64{"cpu": 10},
+		},
+	})
+	if len(
+		tracer.containers,
+	) != 1 || tracer.containers["kata:vm"] == nil || tracer.containers["kata:vm"].containerID != "second" {
+		t.Errorf("filter ignored: %+v", tracer.containers)
+	}
+}
+
+// TestCPUIdleKataScratchMapsReleaseMembers 验证连续刷新复用筛选映射，
+// 当最后一个 Kata 容器离开时清除引用，避免保留过期元数据。
+func TestCPUIdleKataScratchMapsReleaseMembers(t *testing.T) {
+	tracer := &cpuIdleTracing{containers: make(map[string]*containerCPUState)}
+	member := &pod.Container{
+		ID: "checkout", Type: pod.ContainerTypeNormal,
+		RuntimeType: "io.containerd.kata.v2", SandboxID: "checkout-vm", CgroupCss: map[string]uint64{"cpu": 10},
+	}
+	members := map[string]*pod.Container{member.ID: member}
+	tracer.reconcileContainerStates(members)
+	if len(tracer.matchedKata) != 1 || tracer.cssContainers[10] != member {
+		t.Fatal("Kata representative not retained")
+	}
+	clear(members)
+	tracer.reconcileContainerStates(members)
+	if len(tracer.matchedKata) != 0 || len(tracer.cssContainers) != 0 || len(tracer.containers) != 0 {
+		t.Fatal("departed Kata container retained")
 	}
 }

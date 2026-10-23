@@ -23,9 +23,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ccfos/huatuo/internal/auth"
+	"github.com/ccfos/huatuo/internal/httpserver"
+	"github.com/ccfos/huatuo/internal/httpserver/auth"
 	"github.com/ccfos/huatuo/internal/job"
-	"github.com/ccfos/huatuo/internal/server"
 	"github.com/ccfos/huatuo/pkg/observation"
 	profilingdomain "github.com/ccfos/huatuo/pkg/profiling"
 	profilingstore "github.com/ccfos/huatuo/pkg/profiling/store"
@@ -66,6 +66,7 @@ type CreateInput struct {
 
 // RawProfile is one stored profiling window without storage implementation fields.
 type RawProfile struct {
+	SourceType        string
 	Hostname          string
 	Region            string
 	UploadedTimestamp time.Time
@@ -244,6 +245,7 @@ func (s *Service) RawProfiles(
 	items := make([]*RawProfile, 0, len(documents))
 	for _, document := range documents {
 		items = append(items, &RawProfile{
+			SourceType:        document.SourceType,
 			Hostname:          document.Hostname,
 			Region:            document.Region,
 			UploadedTimestamp: document.UploadedTimestamp.Time,
@@ -362,7 +364,7 @@ func buildDashboardURL(baseURL string, resultJob *job.Job) *string {
 
 // NormalizePage applies the public pagination defaults.
 func NormalizePage(limit, offset *int) (int, int) {
-	normalizedLimit := server.DefaultListLimit
+	normalizedLimit := httpserver.DefaultListLimit
 	if limit != nil {
 		normalizedLimit = *limit
 	}

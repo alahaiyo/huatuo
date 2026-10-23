@@ -27,10 +27,10 @@ import (
 	serverapi "github.com/ccfos/huatuo/apis/v1/server"
 	profilinghandler "github.com/ccfos/huatuo/cmd/huatuo-apiserver/handlers/profiling"
 	tracehandler "github.com/ccfos/huatuo/cmd/huatuo-apiserver/handlers/trace"
-	"github.com/ccfos/huatuo/internal/auth"
+	"github.com/ccfos/huatuo/internal/httpserver/auth"
+	"github.com/ccfos/huatuo/internal/httpserver/response"
 	"github.com/ccfos/huatuo/internal/job"
 	profilequery "github.com/ccfos/huatuo/internal/profiling/query"
-	"github.com/ccfos/huatuo/internal/server/response"
 	"github.com/ccfos/huatuo/internal/timeutil"
 	"github.com/ccfos/huatuo/pkg/observation"
 	profilingdomain "github.com/ccfos/huatuo/pkg/profiling"
@@ -555,6 +555,7 @@ func rawProfile(profile *profilinghandler.RawProfile) (serverapi.RawProfile, int
 		return serverapi.RawProfile{}, 0, fmt.Errorf("map raw Profile: encode payload: %w", err)
 	}
 	return serverapi.RawProfile{
+		SourceType:        optionalString(profile.SourceType),
 		Hostname:          profile.Hostname,
 		Region:            profile.Region,
 		UploadedTimestamp: timeutil.Timestamp{Time: profile.UploadedTimestamp},

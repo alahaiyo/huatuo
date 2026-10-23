@@ -23,8 +23,8 @@ import (
 	apiv1 "github.com/ccfos/huatuo/apis/v1"
 	serverapi "github.com/ccfos/huatuo/apis/v1/server"
 	profilinghandler "github.com/ccfos/huatuo/cmd/huatuo-apiserver/handlers/profiling"
+	"github.com/ccfos/huatuo/internal/httpserver/response"
 	"github.com/ccfos/huatuo/internal/job"
-	"github.com/ccfos/huatuo/internal/server/response"
 	"github.com/ccfos/huatuo/pkg/observation"
 	tracingdomain "github.com/ccfos/huatuo/pkg/tracing"
 
@@ -130,5 +130,21 @@ func TestRawProfilesRejectsOversizedEncodedPage(t *testing.T) {
 	}}, 1)
 	if !errors.Is(err, errRawProfileResponseTooLarge) {
 		t.Fatalf("rawProfiles() error = %v, want ErrResponseTooLarge", err)
+	}
+}
+
+func TestRawProfileCarriesProducerOrigin(t *testing.T) {
+	for _, source := range []string{"", "host", "kata_guest"} {
+		got, _, err := rawProfile(&profilinghandler.RawProfile{SourceType: source, Profile: &profilev1.Profile{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if source == "" {
+			if got.SourceType != nil {
+				t.Error("legacy profile gained an origin")
+			}
+		} else if got.SourceType == nil || *got.SourceType != source {
+			t.Errorf("source=%q output=%+v", source, got.SourceType)
+		}
 	}
 }

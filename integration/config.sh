@@ -178,10 +178,14 @@ write_cpusys_autotracing_config() {
 	cat > "${HUATUO_BAMAI_TEST_TMPDIR}/bamai.conf" << EOF
 BlackList = ["arp", "ascend_npu", "memory_threshold_snapshot", "cpu_stat", "cpu_util", "cpuidle", "dload", "dropwatch", "hungtask", "iolatency", "iotracing", "loadavg", "memburst", "memory_buddyinfo", "memory_events", "memory_free", "memory_others", "memory_reclaim", "memory_reclaim_events", "memory_vmstat", "metax_gpu", "mountpoint_perm", "net_rx_latency", "netdev", "netdev_bonding_lacp", "netdev_dcb", "netdev_events", "netdev_hw", "netdev_qdisc", "netdev_rdma_link", "netdev_txqueue_timeout", "netstat", "memory_oom_kill", "ras", "runqlat", "sched_tick", "sockstat", "softirq", "softlockup", "tcp_memory", "tracing_status"]
 
+[HTTPServer]
+    ListenAddress = "${HUATUO_BAMAI_ADDR#http://}"
+
 [HTTPServer.Auth]
     BearerToken = "integration-node-token"
 
 [AutoTracing.CPUSys]
+    Tool = "${CPUSYS_TOOL:-perf}"
     SysThreshold = 45
     DeltaSysThreshold = 20
     Interval = 1
@@ -189,6 +193,20 @@ BlackList = ["arp", "ascend_npu", "memory_threshold_snapshot", "cpu_stat", "cpu_
 
 [Storage.LocalFile]
     Path = "${HUATUO_BAMAI_TEST_TMPDIR}/events"
+EOF
+}
+
+# The CPU profiler test supplies storage and uses the same trigger configuration.
+write_cpusys_profiler_config() {
+	local CPUSYS_TOOL=profiler
+	write_cpusys_autotracing_config
+	cat >> "${HUATUO_BAMAI_TEST_TMPDIR}/bamai.conf" << EOF
+
+[Storage.Elasticsearch]
+    Address = "${STORAGE_ADDR}"
+    Username = "integration"
+    Password = "integration"
+    Index = "cpu-profiler-integration"
 EOF
 }
 
@@ -363,7 +381,7 @@ EOF
 # The caller supplies the real kubelet endpoint, certificates, and output limits.
 write_memory_threshold_snapshot_config() {
 	cat > "${HUATUO_BAMAI_TEST_TMPDIR}/bamai.conf" << EOF
-BlackList = ["arp", "ascend_npu", "cpu_stat", "cpu_util", "cpuidle", "cpusys", "diskio", "dload", "dropwatch", "hungtask", "iolatency", "iotracing", "irqtracing", "loadavg", "memburst", "memory_buddyinfo", "memory_events", "memory_free", "memory_others", "memory_reclaim", "memory_reclaim_events", "memory_vmstat", "metax_gpu", "mountpoint_perm", "mthreads_gpu", "mthreads_xid", "net_rx_latency", "netdev", "netdev_bonding_lacp", "netdev_dcb", "netdev_events", "netdev_hw", "netdev_qdisc", "netdev_rdma_link", "netdev_txqueue_timeout", "netstat", "memory_oom_kill", "ras", "runqlat", "sched_tick", "sockstat", "softirq", "softlockup", "tcp_memory", "tcp_retransmit", "tracing_status"]
+BlackList = ["arp", "ascend_npu", "cpu_stat", "cpu_util", "cpuidle", "cpusys", "diskio", "dload", "dropwatch", "hungtask", "iolatency", "iotracing", "irqtracing", "loadavg", "memburst", "memory_buddyinfo", "memory_events", "memory_free", "memory_others", "memory_reclaim", "memory_reclaim_events", "memory_vmstat", "metax_gpu", "mountpoint_perm", "mthreads_gpu", "mthreads_xid", "net_rx_latency", "netdev", "netdev_bonding_lacp", "netdev_dcb", "netdev_events", "netdev_hw", "netdev_qdisc", "netdev_rdma_link", "netdev_txqueue_timeout", "netstat", "memory_oom_kill", "ras", "runqlat", "sched_tick", "sockstat", "softirq", "softlockup", "tcp_memory", "tcp_retransmit"]
 
 [HTTPServer]
     ListenAddress = "127.0.0.1:${GO_SNAPSHOT_BAMAI_PORT}"
