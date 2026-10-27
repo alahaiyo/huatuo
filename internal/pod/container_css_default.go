@@ -339,7 +339,7 @@ func cgroupCssExistedSync() error {
 
 // ContainerCSSBySubsys retrieves the cgroup subsystem state (CSS) address for a specific
 // container and subsystem. It first checks the local cache, and if not found, triggers
-// a one-time BPF-based collection for that specific container.
+// a one-time BPF-based collection for that specific container and subsystem.
 // This function is compatible with the shared cgroup lifecycle initialization.
 func ContainerCSSBySubsys(containerID, subsysName string) (uint64, error) {
 	if containerID == "" {
@@ -360,7 +360,7 @@ func ContainerCSSBySubsys(containerID, subsysName string) (uint64, error) {
 	}
 
 	// CSS not found in cache, trigger one-time collection
-	if err := syncContainerCSS(containerID); err != nil {
+	if err := syncContainerCSS(containerID, subsysName); err != nil {
 		return 0, fmt.Errorf("sync container CSS: %w", err)
 	}
 
@@ -375,12 +375,13 @@ func ContainerCSSBySubsys(containerID, subsysName string) (uint64, error) {
 	return 0, fmt.Errorf("container %q CSS for subsystem %q not found", containerID, subsysName)
 }
 
-// syncContainerCSS triggers a one-time BPF-based CSS collection for a specific container.
-// It finds the container's cgroup path, reads a notification file to trigger the BPF program,
-// and waits for the CSS data to be populated.
-func syncContainerCSS(containerID string) error {
+// syncContainerCSS triggers a one-time BPF-based CSS collection for a specific container
+// and subsystem. It finds the container's cgroup path inside the hierarchy owning
+// subsysName, reads a notification file to trigger the BPF program, and waits for the
+// CSS data to be populated.
+func syncContainerCSS(containerID, subsysName string) error {
 	// Find container cgroup path
-	cgroupPath, err := findContainerCgroupPath(containerID)
+	cgroupPath, err := findContainerCgroupPath(containerID, subsysName)
 	if err != nil {
 		return fmt.Errorf("find container cgroup path: %w", err)
 	}
@@ -397,53 +398,79 @@ func syncContainerCSS(containerID string) error {
 	return nil
 }
 
-// findContainerCgroupPath resolves the container's kernel cgroup membership on this host.
-func findContainerCgroupPath(containerID string) (string, error) {
-	paths, err := containerCgroupPathsByID(containerID)
+// findContainerCgroupPath resolves the container's kernel cgroup membership inside the
+// hierarchy that owns subsysName.
+func findContainerCgroupPath(containerID, subsysName string) (string, error) {
+	containerPaths, err := containerCgroupPathsByID(containerID)
 	if err != nil {
 		return "", err
 	}
 
-	switch cgroups.CgroupMode() {
+	root, membershipPath, notifyFile, err := cgroupHierarchyForSubsys(
+		cgroups.CgroupMode(),
+		containerPaths,
+		containerID,
+		subsysName,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	cgroupPath, err := resolveCgroupFilesystemPath(root, membershipPath, notifyFile)
+	if err != nil {
+		return "", fmt.Errorf("%s controller: %w", subsysName, err)
+	}
+
+	return cgroupPath, nil
+}
+
+// cgroupHierarchyForSubsys selects the hierarchy owning subsysName and returns its root
+// mount point, the container's membership path inside it, and the notification file whose
+// read triggers CSS collection. A cgroup v1 controller lives in its own hierarchy, so only
+// that controller's directory exposes its CSS; another controller's directory reports the
+// CSS of that other hierarchy and leaves the requested subsystem empty.
+func cgroupHierarchyForSubsys(
+	mode cgroups.Mode,
+	containerPaths *cgroups.ProcessPaths,
+	containerID, subsysName string,
+) (string, string, string, error) {
+	notifyFile, err := cgroupNotifyFile(mode)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	switch mode {
 	case cgroups.Legacy, cgroups.Hybrid:
-		var resolveErrors []error
-		for _, subsys := range cgroupv1SubSysName {
-			membershipPath := paths.Controllers[subsys]
-			if membershipPath == "" {
-				continue
-			}
-
-			cgroupPath, err := resolveCgroupFilesystemPath(
-				cgroups.RootFsFilePath(subsys),
-				membershipPath,
-				cgroupv1NotifyFile,
+		membershipPath := containerPaths.Controllers[subsysName]
+		if membershipPath == "" {
+			return "", "", "", fmt.Errorf(
+				"container %q has no cgroup v1 membership for subsystem %q",
+				containerID,
+				subsysName,
 			)
-			if err == nil {
-				return cgroupPath, nil
-			}
-			resolveErrors = append(resolveErrors, fmt.Errorf("%s controller: %w", subsys, err))
 		}
 
-		if len(resolveErrors) == 0 {
-			return "", fmt.Errorf("container %q has no supported cgroup v1 membership", containerID)
-		}
-		return "", fmt.Errorf(
-			"container %q has no accessible cgroup v1 notification file: %w",
-			containerID,
-			errors.Join(resolveErrors...),
-		)
+		return cgroups.RootFsFilePath(subsysName), membershipPath, notifyFile, nil
 	case cgroups.Unified:
-		if paths.Unified == "" {
-			return "", fmt.Errorf("container %q has no cgroup v2 membership", containerID)
+		if containerPaths.Unified == "" {
+			return "", "", "", fmt.Errorf("container %q has no cgroup v2 membership", containerID)
 		}
 
-		return resolveCgroupFilesystemPath(
-			cgroups.RootfsDefaultPath(),
-			paths.Unified,
-			cgroupv2NotifyFile,
-		)
+		return cgroups.RootfsDefaultPath(), containerPaths.Unified, notifyFile, nil
 	default:
-		return "", fmt.Errorf("unsupported cgroup mode %d", cgroups.CgroupMode())
+		return "", "", "", fmt.Errorf("unsupported cgroup mode %d", mode)
+	}
+}
+
+// cgroupNotifyFile returns the file whose read triggers the CSS collection kprobe.
+func cgroupNotifyFile(mode cgroups.Mode) (string, error) {
+	switch mode {
+	case cgroups.Legacy, cgroups.Hybrid:
+		return cgroupv1NotifyFile, nil
+	case cgroups.Unified:
+		return cgroupv2NotifyFile, nil
+	default:
+		return "", fmt.Errorf("unsupported cgroup mode %d", mode)
 	}
 }
 
@@ -503,12 +530,9 @@ func triggerContainerCSSSync(cgroupPath string) error {
 	time.Sleep(100 * time.Millisecond)
 
 	// Trigger notification by reading the file
-	var notifyFile string
-	switch cgroups.CgroupMode() {
-	case cgroups.Legacy, cgroups.Hybrid:
-		notifyFile = cgroupv1NotifyFile
-	case cgroups.Unified:
-		notifyFile = cgroupv2NotifyFile
+	notifyFile, err := cgroupNotifyFile(cgroups.CgroupMode())
+	if err != nil {
+		return err
 	}
 
 	notifyPath := filepath.Join(cgroupPath, notifyFile)
