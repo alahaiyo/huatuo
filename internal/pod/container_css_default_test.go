@@ -27,6 +27,8 @@ import (
 
 	"github.com/ccfos/huatuo/internal/bpf"
 	"github.com/ccfos/huatuo/internal/bpf/abi"
+	"github.com/ccfos/huatuo/internal/cgroups"
+	"github.com/ccfos/huatuo/internal/cgroups/subsystem"
 
 	"github.com/cilium/ebpf/btf"
 )
@@ -181,6 +183,109 @@ func TestResolveCgroupFilesystemPathRejectsMissingNotificationFile(t *testing.T)
 	}
 	if !strings.Contains(err.Error(), filepath.Join(cgroupPath, cgroupv2NotifyFile)) {
 		t.Fatalf("resolveCgroupFilesystemPath() error = %q, want notification path", err)
+	}
+}
+
+func TestCgroupHierarchyForSubsys(t *testing.T) {
+	t.Parallel()
+
+	containerID := strings.Repeat("a", 64)
+	v1Paths := &cgroups.ProcessPaths{
+		Controllers: map[string]string{
+			"cpu":    "/kubepods/pod/containers/cpu",
+			"memory": "/kubepods/pod/containers/memory",
+		},
+	}
+
+	for _, tc := range []struct {
+		name           string
+		mode           cgroups.Mode
+		paths          *cgroups.ProcessPaths
+		subsysName     string
+		wantRoot       string
+		wantMembership string
+		wantNotifyFile string
+		wantError      string
+	}{
+		{
+			// A cgroup v1 controller must be resolved through its own hierarchy,
+			// otherwise the CSS collected for another controller is returned.
+			name:           "selects the requested cgroup v1 controller hierarchy",
+			mode:           cgroups.Legacy,
+			paths:          v1Paths,
+			subsysName:     subsystem.SubsystemMemory,
+			wantRoot:       cgroups.RootFsFilePath(subsystem.SubsystemMemory),
+			wantMembership: "/kubepods/pod/containers/memory",
+			wantNotifyFile: cgroupv1NotifyFile,
+		},
+		{
+			name:           "selects memory on a hybrid host",
+			mode:           cgroups.Hybrid,
+			paths:          v1Paths,
+			subsysName:     subsystem.SubsystemMemory,
+			wantRoot:       cgroups.RootFsFilePath(subsystem.SubsystemMemory),
+			wantMembership: "/kubepods/pod/containers/memory",
+			wantNotifyFile: cgroupv1NotifyFile,
+		},
+		{
+			name:       "rejects a subsystem outside the container cgroup v1 membership",
+			mode:       cgroups.Legacy,
+			paths:      v1Paths,
+			subsysName: subsystem.SubsystemBlkIO,
+			wantError:  `container "` + containerID + `" has no cgroup v1 membership for subsystem "blkio"`,
+		},
+		{
+			name:           "keeps the single cgroup v2 hierarchy",
+			mode:           cgroups.Unified,
+			paths:          &cgroups.ProcessPaths{Unified: "/kubepods/pod/containers"},
+			subsysName:     subsystem.SubsystemMemory,
+			wantRoot:       cgroups.RootfsDefaultPath(),
+			wantMembership: "/kubepods/pod/containers",
+			wantNotifyFile: cgroupv2NotifyFile,
+		},
+		{
+			name:       "rejects a container without cgroup v2 membership",
+			mode:       cgroups.Unified,
+			paths:      &cgroups.ProcessPaths{},
+			subsysName: subsystem.SubsystemMemory,
+			wantError:  `container "` + containerID + `" has no cgroup v2 membership`,
+		},
+		{
+			name:       "rejects an unknown cgroup mode",
+			mode:       cgroups.Unavailable,
+			paths:      v1Paths,
+			subsysName: subsystem.SubsystemMemory,
+			wantError:  "unsupported cgroup mode 0",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			root, membership, notifyFile, err := cgroupHierarchyForSubsys(
+				tc.mode,
+				tc.paths,
+				containerID,
+				tc.subsysName,
+			)
+			if tc.wantError != "" {
+				if err == nil || err.Error() != tc.wantError {
+					t.Fatalf("cgroupHierarchyForSubsys() error = %v, want %q", err, tc.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("cgroupHierarchyForSubsys() error = %v", err)
+			}
+			if root != tc.wantRoot {
+				t.Errorf("root = %q, want %q", root, tc.wantRoot)
+			}
+			if membership != tc.wantMembership {
+				t.Errorf("membership = %q, want %q", membership, tc.wantMembership)
+			}
+			if notifyFile != tc.wantNotifyFile {
+				t.Errorf("notify file = %q, want %q", notifyFile, tc.wantNotifyFile)
+			}
+		})
 	}
 }
 
