@@ -53,23 +53,13 @@ func updateCgroupCSSCache(data *containerCssPerfEvent, containerID string) {
 	log.Debugf("sync container css data: %+v", data)
 
 	switch data.Operation {
-	case abi.CgroupCSSOperationUpdate:
+	case abi.CgroupCSSOperationUpdate, abi.CgroupCSSOperationRefresh:
 		_ = cgroupUpdateOrCreateCssData(data, containerID)
 	case abi.CgroupCSSOperationRemove:
 		_ = cgroupDeleteCssData(data, containerID)
 	default:
 		log.Errorf("unsupported cgroup CSS operation: %+v", data)
 	}
-}
-
-func parseContainerCSS(containerID string) (map[string]uint64, error) {
-	msg := make(map[string]uint64)
-	cssList := cgroupListCssDataByKnode(containerID)
-	for _, css := range cssList {
-		msg[css.SubSys] = css.CSS
-	}
-
-	return msg, nil
 }
 
 const (
@@ -80,12 +70,14 @@ var (
 	cgroupv1SubSysName        = []string{subsystem.SubsystemCPU, subsystem.SubsystemCPUAcct, subsystem.SubsystemCPUSet, subsystem.SubsystemMemory, subsystem.SubsystemBlkIO}
 	cgroupv1NotifyFile        = "cgroup.clone_children"
 	cgroupv2NotifyFile        = "memory.current"
+	cgroupv2CPUNotifyFile     = "cpu.weight.nice"
 	cgroupCssID2SubSysNameMap = map[int]string{}
 	cgroupCssMetaDataMap      sync.Map
 )
 
 type containerCssMetaData struct {
 	CSS         uint64
+	Inode       uint64
 	SubSys      string
 	Cgroup      uint64
 	CgroupRoot  int32
@@ -93,48 +85,48 @@ type containerCssMetaData struct {
 	ContainerID string
 }
 
-func cgroupListCssDataByKnode(containerID string) []*containerCssMetaData {
-	res := []*containerCssMetaData{}
-	cgroupCssMetaDataMap.Range(func(k, v any) bool {
-		if m, ok := v.(*containerCssMetaData); ok {
-			if m.ContainerID == containerID {
-				res = append(res, m)
-			}
-		}
-		return true
-	})
-	return res
-}
-
 func cgroupUpdateOrCreateCssData(data *containerCssPerfEvent, containerID string) error {
-	if containerID == "" {
+	if containerID == "" && data.Inode == 0 {
 		return fmt.Errorf("knode name is not containterID")
 	}
 
+	changed := false
 	for index, css := range data.CSS {
 		if css == 0 {
 			continue
 		}
 
 		if sysName, ok := cgroupCssID2SubSysNameMap[index]; ok {
-			m := &containerCssMetaData{
+			m := containerCssMetaData{
 				CSS:         css,
+				Inode:       data.Inode,
 				Cgroup:      data.Cgroup,
 				CgroupRoot:  data.CgroupRoot,
 				CgroupLevel: data.CgroupLevel,
 				ContainerID: containerID,
 				SubSys:      sysName,
 			}
-			log.Debugf("update container css data: %+v", m)
-			cgroupCssMetaDataMap.Store(css, m)
+			if previous, ok := cgroupCssMetaDataMap.Load(css); ok && *previous.(*containerCssMetaData) == m {
+				continue
+			}
+			updated := m
+			log.Debugf("update container css data: %+v", &updated)
+			cgroupCssMetaDataMap.Store(css, &updated)
+			changed = true
 		}
 	}
 
+	// Read notifications arrive asynchronously, possibly after the bound view
+	// was published. Only new information may trigger another discovery;
+	// unchanged notifications from that discovery must not feed back into it.
+	if changed && data.Operation == abi.CgroupCSSOperationRefresh {
+		requestWorkloadRefresh("", false)
+	}
 	return nil
 }
 
 func cgroupDeleteCssData(data *containerCssPerfEvent, containerID string) error {
-	if containerID == "" {
+	if containerID == "" && data.Inode == 0 {
 		return fmt.Errorf("knode name is not containterID")
 	}
 
@@ -175,7 +167,10 @@ func cgroupRootNotify(realRoot, name string) error {
 		}
 
 		notifyPath := filepath.Join(path, name)
-		_, _ = os.ReadFile(notifyPath)
+		_, readErr := os.ReadFile(notifyPath)
+		if errors.Is(readErr, os.ErrNotExist) && name == cgroupv2NotifyFile {
+			_, _ = os.ReadFile(filepath.Join(path, cgroupv2CPUNotifyFile))
+		}
 
 		log.Debugf("read cgroup path: %s", notifyPath)
 		return filepath.SkipDir
@@ -337,158 +332,6 @@ func cgroupCssExistedSync() error {
 	return nil
 }
 
-// ContainerCSSBySubsys retrieves the cgroup subsystem state (CSS) address for a specific
-// container and subsystem. It first checks the local cache, and if not found, triggers
-// a one-time BPF-based collection for that specific container and subsystem.
-// This function is compatible with the shared cgroup lifecycle initialization.
-func ContainerCSSBySubsys(containerID, subsysName string) (uint64, error) {
-	if containerID == "" {
-		return 0, nil
-	}
-
-	// Ensure subsystem IDs are initialized
-	if err := cgroupInitSubSysIDs(); err != nil {
-		return 0, fmt.Errorf("init subsystem IDs: %w", err)
-	}
-
-	// Check if CSS data already exists in cache
-	cssList := cgroupListCssDataByKnode(containerID)
-	for _, css := range cssList {
-		if css.SubSys == subsysName {
-			return css.CSS, nil
-		}
-	}
-
-	// CSS not found in cache, trigger one-time collection
-	if err := syncContainerCSS(containerID, subsysName); err != nil {
-		return 0, fmt.Errorf("sync container CSS: %w", err)
-	}
-
-	// Retry lookup after sync
-	cssList = cgroupListCssDataByKnode(containerID)
-	for _, css := range cssList {
-		if css.SubSys == subsysName {
-			return css.CSS, nil
-		}
-	}
-
-	return 0, fmt.Errorf("container %q CSS for subsystem %q not found", containerID, subsysName)
-}
-
-// syncContainerCSS triggers a one-time BPF-based CSS collection for a specific container
-// and subsystem. It finds the container's cgroup path inside the hierarchy owning
-// subsysName, reads a notification file to trigger the BPF program, and waits for the
-// CSS data to be populated.
-func syncContainerCSS(containerID, subsysName string) error {
-	// Find container cgroup path
-	cgroupPath, err := findContainerCgroupPath(containerID, subsysName)
-	if err != nil {
-		return fmt.Errorf("find container cgroup path: %w", err)
-	}
-
-	if cgroupPath == "" {
-		return fmt.Errorf("container %q cgroup path not found", containerID)
-	}
-
-	// Load BPF for one-time sync (similar to cgroupCssExistedSync but targeted)
-	if err := triggerContainerCSSSync(cgroupPath); err != nil {
-		return fmt.Errorf("trigger CSS sync: %w", err)
-	}
-
-	return nil
-}
-
-// findContainerCgroupPath resolves the container's kernel cgroup membership inside the
-// hierarchy that owns subsysName.
-func findContainerCgroupPath(containerID, subsysName string) (string, error) {
-	containerPaths, err := containerCgroupPathsByID(containerID)
-	if err != nil {
-		return "", err
-	}
-
-	root, membershipPath, notifyFile, err := cgroupHierarchyForSubsys(
-		cgroups.CgroupMode(),
-		containerPaths,
-		containerID,
-		subsysName,
-	)
-	if err != nil {
-		return "", err
-	}
-
-	cgroupPath, err := resolveCgroupFilesystemPath(root, membershipPath, notifyFile)
-	if err != nil {
-		return "", fmt.Errorf("%s controller: %w", subsysName, err)
-	}
-
-	return cgroupPath, nil
-}
-
-// cgroupHierarchyForSubsys selects the hierarchy owning subsysName and returns its root
-// mount point, the container's membership path inside it, and the notification file whose
-// read triggers CSS collection. A cgroup v1 controller lives in its own hierarchy, so only
-// that controller's directory exposes its CSS; another controller's directory reports the
-// CSS of that other hierarchy and leaves the requested subsystem empty.
-func cgroupHierarchyForSubsys(
-	mode cgroups.Mode,
-	containerPaths *cgroups.ProcessPaths,
-	containerID, subsysName string,
-) (string, string, string, error) {
-	notifyFile, err := cgroupNotifyFile(mode)
-	if err != nil {
-		return "", "", "", err
-	}
-
-	switch mode {
-	case cgroups.Legacy, cgroups.Hybrid:
-		membershipPath := containerPaths.Controllers[subsysName]
-		if membershipPath == "" {
-			return "", "", "", fmt.Errorf(
-				"container %q has no cgroup v1 membership for subsystem %q",
-				containerID,
-				subsysName,
-			)
-		}
-
-		return cgroups.RootFsFilePath(subsysName), membershipPath, notifyFile, nil
-	case cgroups.Unified:
-		if containerPaths.Unified == "" {
-			return "", "", "", fmt.Errorf("container %q has no cgroup v2 membership", containerID)
-		}
-
-		return cgroups.RootfsDefaultPath(), containerPaths.Unified, notifyFile, nil
-	default:
-		return "", "", "", fmt.Errorf("unsupported cgroup mode %d", mode)
-	}
-}
-
-// cgroupNotifyFile returns the file whose read triggers the CSS collection kprobe.
-func cgroupNotifyFile(mode cgroups.Mode) (string, error) {
-	switch mode {
-	case cgroups.Legacy, cgroups.Hybrid:
-		return cgroupv1NotifyFile, nil
-	case cgroups.Unified:
-		return cgroupv2NotifyFile, nil
-	default:
-		return "", fmt.Errorf("unsupported cgroup mode %d", mode)
-	}
-}
-
-func resolveCgroupFilesystemPath(root, membershipPath, notifyFile string) (string, error) {
-	realRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", fmt.Errorf("resolve cgroup root %q: %w", root, err)
-	}
-
-	cgroupPath := filepath.Join(realRoot, strings.TrimPrefix(membershipPath, "/"))
-	notifyPath := filepath.Join(cgroupPath, notifyFile)
-	if _, err := os.Stat(notifyPath); err != nil {
-		return "", fmt.Errorf("access cgroup notification file %q: %w", notifyPath, err)
-	}
-
-	return cgroupPath, nil
-}
-
 // triggerContainerCSSSync loads BPF and triggers CSS collection for a specific cgroup path.
 func triggerContainerCSSSync(cgroupPath string) error {
 	// Load BPF for CSS collection
@@ -530,9 +373,12 @@ func triggerContainerCSSSync(cgroupPath string) error {
 	time.Sleep(100 * time.Millisecond)
 
 	// Trigger notification by reading the file
-	notifyFile, err := cgroupNotifyFile(cgroups.CgroupMode())
-	if err != nil {
-		return err
+	var notifyFile string
+	switch cgroups.CgroupMode() {
+	case cgroups.Legacy, cgroups.Hybrid:
+		notifyFile = cgroupv1NotifyFile
+	case cgroups.Unified:
+		notifyFile = cgroupv2NotifyFile
 	}
 
 	notifyPath := filepath.Join(cgroupPath, notifyFile)
@@ -546,4 +392,56 @@ func triggerContainerCSSSync(cgroupPath string) error {
 	time.Sleep(500 * time.Millisecond)
 
 	return nil
+}
+
+// CgroupCSSByPath resolves CSS by kernel directory identity, independent of a source ID.
+func CgroupCSSByPath(subsysName, membership string) (uint64, error) {
+	if membership == "" || membership == "/" {
+		return 0, fmt.Errorf("a non-root cgroup membership is required")
+	}
+	if err := cgroupInitSubSysIDs(); err != nil {
+		return 0, fmt.Errorf("init subsystem IDs: %w", err)
+	}
+	mounts, err := cgroupMounts()
+	if err != nil {
+		return 0, err
+	}
+	controller := subsysName
+	if cgroups.CgroupMode() == cgroups.Unified {
+		controller = ""
+	}
+	directory, info, err := resolveCgroupDirectory(mounts, controller, membership)
+	if err != nil {
+		return 0, err
+	}
+	inode := info.Sys().(*syscall.Stat_t).Ino
+	lookup := func() uint64 {
+		var address uint64
+		cgroupCssMetaDataMap.Range(func(_, value any) bool {
+			data := value.(*containerCssMetaData)
+			if data.Inode == inode && data.SubSys == subsysName {
+				address = data.CSS
+				return false
+			}
+			return true
+		})
+		return address
+	}
+	if address := lookup(); address != 0 {
+		return address, nil
+	}
+	if err := triggerContainerCSSSync(directory); err != nil {
+		return 0, err
+	}
+	current, err := os.Lstat(directory)
+	if err != nil {
+		return 0, err
+	}
+	if !os.SameFile(info, current) {
+		return 0, fmt.Errorf("cgroup directory %q changed during CSS lookup", directory)
+	}
+	if address := lookup(); address != 0 {
+		return address, nil
+	}
+	return 0, fmt.Errorf("%s CSS not found for cgroup %q", subsysName, membership)
 }

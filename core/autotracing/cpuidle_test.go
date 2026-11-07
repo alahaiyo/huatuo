@@ -23,8 +23,11 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/ccfos/huatuo/internal/cgroups"
 	"github.com/ccfos/huatuo/internal/cgroups/stats"
+	"github.com/ccfos/huatuo/internal/matcher"
 	"github.com/ccfos/huatuo/internal/pod"
 	"github.com/ccfos/huatuo/internal/utils/cpuutil"
 )
@@ -372,6 +375,7 @@ func TestCPUIdleTracingReconcileContainerStates(t *testing.T) {
 	tracer.reconcileContainerStates(map[string]*pod.Container{
 		"keep": {
 			ID:         "keep",
+			Type:       pod.ContainerTypeNormal,
 			CgroupPath: "new",
 		},
 	})
@@ -502,39 +506,109 @@ func TestCPUIdleTracingSelectTraceTargetHonorsMinTraceInterval(t *testing.T) {
 func TestCPUIdleTracingUpdateContainerCPUStatesErrors(t *testing.T) {
 	t.Parallel()
 
-	previousSampleAt := time.Unix(99, 0)
-	reader := &stubContainerCPUReader{
-		quotaErr: map[string]error{
-			"deleted": os.ErrNotExist,
+	tests := []struct {
+		name     string
+		quotaErr error
+		usageErr error
+		wantErr  error
+	}{
+		{
+			name:     "quota file removed before open",
+			quotaErr: os.ErrNotExist,
+		},
+		{
+			name:     "quota cgroup removed during read",
+			quotaErr: unix.ENODEV,
+		},
+		{
+			name:     "usage file removed before open",
+			usageErr: os.ErrNotExist,
+		},
+		{
+			name:     "usage cgroup removed during read",
+			usageErr: unix.ENODEV,
+		},
+		{
+			name:     "quota permission denied",
+			quotaErr: os.ErrPermission,
+			wantErr:  os.ErrPermission,
+		},
+		{
+			name:     "usage io failure",
+			usageErr: unix.EIO,
+			wantErr:  unix.EIO,
 		},
 	}
-	tracer := &cpuIdleTracing{
-		cgroupReader: reader,
-		containers: map[string]*containerCPUState{
-			"deleted": {
-				containerID:    "deleted",
-				cgroupPath:     "deleted",
-				currentPercent: cpuUsageBreakdown[int64]{user: 80},
-				percentDelta:   cpuUsageBreakdown[int64]{user: 45},
-				hasPercent:     true,
-				lastSampleAt:   previousSampleAt,
-			},
-		},
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	sampledAt := time.Unix(100, 0)
-	if err := tracer.updateContainerCPUStates(sampledAt); err != nil {
-		t.Fatalf("updateContainerCPUStates(deleted) error = %v", err)
-	}
-	if traceTarget := tracer.selectTraceTarget(sampledAt); traceTarget != nil {
-		t.Errorf("selectTraceTarget(deleted) = %q, want nil", traceTarget.containerID)
-	}
+			quota := stats.CpuQuota{
+				Quota:             100_000,
+				Period:            100_000,
+				EffectiveCPUCount: 1,
+			}
+			reader := &stubContainerCPUReader{
+				quota: map[string]stats.CpuQuota{
+					"removed": quota,
+					"running": quota,
+				},
+				quotaErr: make(map[string]error),
+				usageErr: make(map[string]error),
+			}
+			if tt.quotaErr != nil {
+				reader.quotaErr["removed"] = &os.PathError{
+					Op:   "read",
+					Path: "removed/cpu.max",
+					Err:  tt.quotaErr,
+				}
+			}
+			if tt.usageErr != nil {
+				reader.usageErr["removed"] = &os.PathError{
+					Op:   "read",
+					Path: "removed/cpu.stat",
+					Err:  tt.usageErr,
+				}
+			}
 
-	readErr := errors.New("permission denied")
-	reader.quotaErr["deleted"] = readErr
-	err := tracer.updateContainerCPUStates(time.Unix(101, 0))
-	if !errors.Is(err, readErr) {
-		t.Fatalf("updateContainerCPUStates(failed) error = %v, want %v", err, readErr)
+			previousSampleAt := time.Unix(99, 0)
+			tracer := &cpuIdleTracing{
+				cgroupReader: reader,
+				containers: map[string]*containerCPUState{
+					"removed": {
+						containerID:    "removed",
+						cgroupPath:     "removed",
+						currentPercent: cpuUsageBreakdown[int64]{user: 80},
+						percentDelta:   cpuUsageBreakdown[int64]{user: 45},
+						hasPercent:     true,
+						lastSampleAt:   previousSampleAt,
+					},
+					"running": {
+						containerID: "running",
+						cgroupPath:  "running",
+					},
+				},
+			}
+
+			sampledAt := time.Unix(100, 0)
+			err := tracer.updateContainerCPUStates(sampledAt)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("updateContainerCPUStates() error = %v, want %v", err, tt.wantErr)
+			}
+			if tt.wantErr != nil {
+				return
+			}
+
+			if !tracer.containers["removed"].lastSampleAt.Equal(previousSampleAt) {
+				t.Error("failed sample replaced the removed container's measurement")
+			}
+			if !tracer.containers["running"].lastSampleAt.Equal(sampledAt) {
+				t.Error("running container was not sampled after a container disappeared")
+			}
+			if traceTarget := tracer.selectTraceTarget(sampledAt); traceTarget != nil {
+				t.Errorf("selectTraceTarget() = %q, want nil", traceTarget.containerID)
+			}
+		})
 	}
 }
 
@@ -585,5 +659,125 @@ func TestCPUIdleTracingDataJSON(t *testing.T) {
 		if actualValue, ok := actual[field]; !ok || string(actualValue) != expectedValue {
 			t.Errorf("JSON field %q = %s, want %s", field, actualValue, expectedValue)
 		}
+	}
+}
+
+func TestCPUIdleKataSharedState(t *testing.T) {
+	tracer := &cpuIdleTracing{containers: make(map[string]*containerCPUState)}
+	first := &pod.Container{
+		ID:          "z-first",
+		Type:        pod.ContainerTypeNormal,
+		RuntimeType: "io.containerd.kata-qemu.v2",
+		SandboxID:   "vm",
+		SyncedAt:    time.Unix(1, 0),
+		CgroupPath:  "/kata/vm",
+		CgroupCss:   map[string]uint64{"cpu": 10},
+	}
+	second := *first
+	second.ID = "a-second"
+	second.SyncedAt = time.Unix(2, 0)
+	members := map[string]*pod.Container{
+		first.ID:  first,
+		second.ID: &second,
+		"runc":    {ID: "runc", Type: pod.ContainerTypeNormal, CgroupPath: "/runc"},
+		"guest":   {ID: "guest", Type: pod.ContainerTypeNormal, CgroupPath: "/guest"},
+	}
+	tracer.reconcileContainerStates(members)
+	state := tracer.containers["kata:vm"]
+	if len(tracer.containers) != 3 || state == nil || state.containerID != first.ID {
+		t.Fatalf("unexpected shared state: %+v", tracer.containers)
+	}
+	state.previousUsage.total = 123
+	state.hasUsage = true
+	state.lastTraceAt = time.Unix(100, 0)
+	for range 100 {
+		tracer.reconcileContainerStates(members)
+		if tracer.containers["kata:vm"] != state || state.containerID != first.ID {
+			t.Fatal("representative is not stable")
+		}
+	}
+	delete(members, first.ID)
+	tracer.reconcileContainerStates(members)
+	if tracer.containers["kata:vm"] != state ||
+		state.containerID != second.ID ||
+		state.previousUsage.total != 123 ||
+		!state.hasUsage ||
+		!state.lastTraceAt.Equal(
+			time.Unix(100, 0),
+		) {
+		t.Errorf("representative handoff reset shared measurements: %+v", state)
+	}
+	second.CgroupCss = map[string]uint64{"cpu": 11}
+	tracer.reconcileContainerStates(members)
+	if state.hasUsage || state.previousUsage.total != 0 || !state.lastTraceAt.Equal(time.Unix(100, 0)) {
+		t.Errorf("VM replacement must reset baseline and keep cooldown: %+v", state)
+	}
+	second.SandboxID = "new-vm"
+	tracer.reconcileContainerStates(members)
+	if tracer.containers["kata:vm"] != nil ||
+		tracer.containers["kata:new-vm"] == nil ||
+		!tracer.containers["kata:new-vm"].lastTraceAt.IsZero() {
+		t.Error("new sandbox reused old cooldown")
+	}
+	second.CgroupCss = nil
+	tracer.reconcileContainerStates(members)
+	if state := tracer.containers["kata:new-vm"]; state == nil || state.containerID != "" || state.hasUsage {
+		t.Error("Kata without CPU CSS must retain only its VM lifetime state")
+	}
+}
+
+func TestCPUIdleKataRepresentativeRespectsFilter(t *testing.T) {
+	config := &ContainerFilterConfig{
+		Excluded: []*matcher.Rule{{Field: matcher.FieldTypeContainerHostname, Pattern: "^excluded$"}},
+	}
+	filter, err := config.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracer := &cpuIdleTracing{filter: filter, containers: make(map[string]*containerCPUState)}
+	tracer.reconcileContainerStates(map[string]*pod.Container{
+		"first": {
+			ID:          "first",
+			Type:        pod.ContainerTypeNormal,
+			Hostname:    "excluded",
+			RuntimeType: "io.containerd.kata.v2",
+			SandboxID:   "vm",
+			SyncedAt:    time.Unix(1, 0),
+			CgroupCss:   map[string]uint64{"cpu": 10},
+		},
+		"second": {
+			ID:          "second",
+			Type:        pod.ContainerTypeNormal,
+			Hostname:    "included",
+			RuntimeType: "io.containerd.kata.v2",
+			SandboxID:   "vm",
+			SyncedAt:    time.Unix(2, 0),
+			CgroupCss:   map[string]uint64{"cpu": 10},
+		},
+	})
+	if len(
+		tracer.containers,
+	) != 1 || tracer.containers["kata:vm"] == nil || tracer.containers["kata:vm"].containerID != "second" {
+		t.Errorf("filter ignored: %+v", tracer.containers)
+	}
+}
+
+// TestCPUIdleKataScratchMapsReleaseMembers 验证连续刷新复用筛选映射，
+// 当最后一个 Kata 容器离开时清除引用，避免保留过期元数据。
+func TestCPUIdleKataScratchMapsReleaseMembers(t *testing.T) {
+	tracer := &cpuIdleTracing{containers: make(map[string]*containerCPUState)}
+	member := &pod.Container{
+		ID: "checkout", Type: pod.ContainerTypeNormal,
+		RuntimeType: "io.containerd.kata.v2", SandboxID: "checkout-vm", CgroupCss: map[string]uint64{"cpu": 10},
+	}
+	members := map[string]*pod.Container{member.ID: member}
+	tracer.reconcileContainerStates(members)
+	if len(tracer.matchedKata) != 1 || tracer.cssContainers[10] != member {
+		t.Fatal("Kata representative not retained")
+	}
+	clear(members)
+	tracer.reconcileContainerStates(members)
+	if len(tracer.matchedKata) != 0 || len(tracer.cssContainers) != 0 || len(tracer.containers) != 0 {
+		t.Fatal("departed Kata container retained")
 	}
 }

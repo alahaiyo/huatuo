@@ -27,6 +27,34 @@ huatuo_bamai_runqlat_container_latency{container_host="coredns-855c4dd65d-8v5kg"
 
 This example shows host and container scheduling-latency bucket counts. The `zone` ranges are listed below.
 
+## Build Information
+
+`huatuo_bamai_build_info` and `huatuo_apiserver_build_info` are Gauges with a
+constant value of `1`, describing the running bamai and apiserver builds
+respectively. Each is exposed by its application’s `/metrics` endpoint and
+uses the same build information as that application’s `/version` endpoint.
+They carry the existing `host` and `region` labels (empty for apiserver) and
+these build labels:
+
+| Label | Meaning |
+| --- | --- |
+| `name` | Application name, matching `name` in `/version` |
+| `version` | Application release version, matching `version` in `/version` |
+| `git_commit` | Build Git identifier, matching `git_commit` in `/version`; not necessarily a full SHA |
+| `git_tree_state` | Build working-tree state: `clean`, `dirty`, or `unknown` |
+| `build_time` | Timestamp from `/version`: injected build time, falling back to VCS commit time or `(devel)` |
+| `go_version` | Go toolchain version used to build the application |
+| `compiler` | Go compiler, such as `gc` |
+| `platform` | Operating system and architecture, such as `linux/amd64` |
+
+When no release version is supplied, `version` uses `(devel)`. `git_commit`
+uses the injected identifier first, then the VCS revision from Go build information,
+and falls back to `(devel)` when neither is available.
+Build labels apply only to this metric; business metric labels remain unchanged.
+After scraping, join build information with business metrics using the same
+`job` and `instance`. Cross-cluster queries must also include the labels that
+distinguish targets between clusters.
+
 ## CPU
 
 ### Scheduling Latency
@@ -37,6 +65,9 @@ Scheduling latency is the wait from becoming runnable to actually receiving CPU 
 | --- | --- | --- | --- | --- | --- |
 | `runqlat_container_latency` | Scheduling-latency bucket count | Count | Container | eBPF | zone |
 | `runqlat_latency` | Scheduling-latency bucket count | Count | Host | eBPF | zone |
+| `runqlat_workload_latency` | Sandbox scheduling-latency bucket count | Count | Sandbox Host | eBPF | zone, common workload labels |
+
+Workload attribution uses bound CPU CSS without a representative PID, network or memory controller. Workloads without CSS are skipped rather than emitting stale cached values. Normal-container selection, Kata shared-cgroup representatives and container labels are preserved. Instance counters survive metadata refreshes. V1/v2 require the corresponding CSS and scheduler probes. This is a common collector capability; the production CubeSandbox source is still pending, and no sandbox Guest metrics are added.
 
 ### Softirq Latency
 
@@ -93,6 +124,22 @@ Counts periods and time using burst CPU capacity. Emitted only when the kernel p
 | `cpu_stat_container_burst_time` | Cumulative time using burst CPU capacity | Nanoseconds | Container | — |
 | `cpu_stat_container_nr_bursts` | Cumulative periods using burst CPU capacity | Count | Container | — |
 
+### Sandbox CPU File Metrics
+
+`cpu_util` and `cpu_stat` can collect from common workload cgroup bindings while preserving existing `container_` metrics and labels. Sandboxes use the corresponding metrics below. CubeSandbox/OpenSandbox discovery is not yet enabled in configuration; this collection path is currently validated with synthetic sources.
+
+| Metric | Meaning and unit |
+| --- | --- |
+| `cpu_util_workload_cores` | Available CPU capacity, cores |
+| `cpu_util_workload_usr`, `cpu_util_workload_sys`, `cpu_util_workload_total` | User, kernel and total utilization, % |
+| `cpu_stat_workload_nr_throttled`, `cpu_stat_workload_throttled_time` | Cumulative throttled periods and time (nanoseconds) |
+| `cpu_stat_workload_wait_sum_percent` | Interval wait ratio, % |
+| `cpu_stat_workload_nr_bursts`, `cpu_stat_workload_burst_time` | Cumulative burst periods and time (nanoseconds) |
+
+The fixed common labels are `host`, `region`, `workload_id`, `workload_type`, `workload_name` and `workload_namespace`. Missing names use the ID; unknown namespaces keep an empty value. Collector labels are retained, source Labels are not expanded, and container-specific labels are not added.
+
+CPU file metrics require no representative PID, network or CSS. V1 reads independently bound cpu, cpuacct and cpuset directories; v2 reads the bound unified directory, including mounted subtrees. Missing resources never fall back to host directories. Without cpuacct, utilization and wait ratio are unavailable, but readable throttle and burst counters remain available. Absent kernel fields are omitted. Capacity retains the effective-cpuset, quota and online-core rules. Metadata refreshes preserve per-instance accounting baselines. This does not add sandbox Guest metrics.
+
 ### Load
 
 Hosts report 1-, 5-, and 15-minute load averages. Containers report current runnable and uninterruptible task counts, which use a different time basis.
@@ -104,6 +151,10 @@ Hosts report 1-, 5-, and 15-minute load averages. Containers report current runn
 | `loadavg_load15` | System load average over the past 15 minutes | Tasks | Host | — | — |
 | `loadavg_container_nr_running` | Current runnable tasks, including running tasks and tasks waiting for CPU | Count | Container | — | cgroup v1 only |
 | `loadavg_container_nr_uninterruptible` | Uninterruptible tasks in the container | Count | Container | — | cgroup v1 only |
+| `loadavg_workload_nr_running` | Current runnable tasks in the sandbox | Count | Sandbox Host | Common workload labels | Requires legacy v1 and TASKSTATS |
+| `loadavg_workload_nr_uninterruptible` | Current uninterruptible tasks in the sandbox | Count | Sandbox Host | Common workload labels | Same requirement |
+
+Workload load uses the bound v1 CPU directory without a representative PID, netns or CSS. Missing directories or failed kernel queries skip only that workload; host load averages remain available. The existing legacy-only mode restriction is retained, with no new v2/hybrid support. Container labels and normal/sidecar selection remain unchanged. Sandbox entries describe the common collector capability; the production CubeSandbox source is still pending.
 
 ## Memory
 
@@ -119,11 +170,21 @@ Memory reclaim and compaction can block tasks. These metrics record host cumulat
 
 `memory_others_container_directstall_time`, `memory_others_container_asyncreclaim_time`, and `memory_others_container_local_direct_reclaim_time` depend on DiDi custom-kernel interfaces `memory.directstall_stat`, `memory.asynreclaim_stat`, and `memory.local_direct_reclaim_time`.
 
+Sandbox equivalents use the `memory_others_workload_` prefix and fixed workload labels, reading the same files from bound memory/unified directories without CPU, PID or CSS requirements. Missing or malformed optional files skip only that metric. Startup probes support legacy memory and unified roots. Sandbox discovery remains unavailable in configuration.
+
 Mainline and common distribution kernels without these interfaces do not emit the metrics; no additional module is needed. Use `memory_reclaim_container_directstall` for container direct-reclaim counts on standard kernels.
+
+### Memory Event Counts
+
+`memory_events` reads `memory.events` from the workload's bound memory/unified directory. Container names remain `memory_events_container_<field>`; sandboxes emit `memory_events_workload_<field>`, such as `memory_events_workload_oom`, with the six fixed workload labels. Kernel counts retain the existing Gauge type and `MetricCollector.MemoryEvents.Included/Excluded` field filters.
+
+No CPU, process or CSS binding is required. Missing memory bindings or files skip that workload; malformed contents remain errors. Sandbox discovery is not yet enabled in configuration; this path is validated with synthetic sources.
 
 ### Memory State
 
 Container fields come from `memory.stat`; host fields from `/proc/vmstat`. Both are subject to `MetricCollector.Vmstat` filters. Field availability and meanings depend on kernel and cgroup versions.
+
+Sandbox equivalents use `memory_vmstat_workload_<field>` names (for example, `memory_vmstat_workload_active_file`) and the six fixed workload labels. Container names remain unchanged. Collection reads only bound memory/unified directories and requires no CPU, PID or CSS. Missing or malformed workload files do not discard other workloads or Host metrics. Sandboxes reuse the legacy `IncludedOnContainer` / `ExcludedOnContainer` filters until a separate naming and compatibility migration. Sandbox discovery is not yet enabled in configuration.
 
 **Container memory**
 
@@ -242,6 +303,27 @@ Shows free block counts by NUMA node, memory zone, and order. `order=n` means ea
 | --- | --- | --- | --- | --- | --- |
 | `memory_buddyinfo_blocks` | Free blocks for the specified NUMA node, zone, and order | Blocks | Host | procfs | node, order, zone |
 
+<a id="add-container-reclaim-and-compaction-stall-times"></a>
+
+### Container reclaim and compaction stall times
+
+|Metric|Description|Unit|Target|Source|Labels|
+|---|---|---|---|---|---|
+|memory_free_container_allocpages_stall|Container task time in global direct reclaim| milliseconds|Container| eBPF | container_host, container_hostnamespace, container_level, container_name, container_type, host, region|
+|memory_free_container_compaction_stall|Container task time in direct compaction| milliseconds|Container| eBPF | same container labels|
+
+These cumulative Gauge values measure task time in global direct reclaim and compaction. Host totals include container work. Missing or ambiguous container records are omitted; container collection failures preserve host output. Loading requires the container probes; a load or attachment failure disables this collector. Container recreation starts a new container total without resetting the host total. BPF reload resets both.
+
+<a id="add-a-host-wide-memcg-reclaim-count"></a>
+
+### Host-wide memcg reclaim count
+
+|Metric|Description|Unit|Target|Source|Labels|
+|---|---|---|---|---|---|
+|memory_reclaim_directstall|Cumulative host-wide memcg limit reclaim events| count| Host| eBPF | host, region|
+
+This Gauge counts host-wide memcg reclaim events, excluding kswapd; it is not a global reclaim count or duration. Host totals include container activity and must not be added to container counts. BPF reload resets the total.
+
 ## Network
 
 ### TCP Memory
@@ -295,6 +377,12 @@ Counts receive-side hardware drops for supported NIC drivers. It prefers `rx_mis
 | Metric | Description | Unit | Scope | Source | Additional Labels |
 | --- | --- | --- | --- | --- | --- |
 | `netdev_hw_rx_dropped_total` | Cumulative receive-side hardware drops | Count | Host | sysfs, eBPF | device, driver |
+
+### RDMA Port Statistics
+
+`netdev_rdma_link_<counter>` exposes per-port kernel counters; available names depend on the driver. Additional labels are `device`, `nodeguid`, `index`, `num_ports`, and `port`.
+
+The new `port` label creates new time series, including on single-port devices. Keep it for port-level queries. For a selected counter, use `sum by (region, host, device) (<metric>)` for device totals, or `sum by (region, host, device) (rate(<metric>[5m]))` for device rates; replace `<metric>` with the full metric name. Grouping only by `device` mixes identically named devices across hosts.
 
 ### NIC Statistics
 
@@ -571,7 +659,7 @@ seconds of waiting, between successful collections. For example, 10,240 waits
 for one series, each lasting 270 seconds and settled on that CPU in the same
 interval, exceed the wait-time capacity.
 
-IOCOST requires a non-PREEMPT_RT Linux x86_64 kernel with IOCOST functions,
+IOCOST requires a non-PREEMPT_RT Linux kernel with IOCOST functions,
 BPF/BTF, and kprobes.
 
 ### Device health
@@ -694,6 +782,14 @@ Records hung-task events detected by the kernel.
 | Metric | Description | Unit | Scope | Source | Additional Labels |
 | --- | --- | --- | --- | --- | --- |
 | `hungtask_total` | System hung-task event count | Count | Host | eBPF | — |
+
+### attribute hungtask events and counts to containers
+
+|Metric|Description|Unit|Target|Source|Labels|
+|---|---|---|---|---|---|
+|hungtask_container_total|Events attributed to blocked container tasks|count|Container|BPF + CSS cache|container_host, container_hostnamespace, container_level, container_name, container_type, host, region|
+
+Container counts are included in the host Counter and are independent of trace backoff. Events with unresolved container attribution still contribute to the host count. Container exit removes its count; agent restart resets counts. Repeated reports of the same blocked task count as separate events.
 
 ## GPU
 

@@ -20,13 +20,21 @@ package bpf
 import (
 	"errors"
 	"fmt"
-	"runtime"
+	"os"
+	"strconv"
+	"strings"
 
 	"github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 
-var errInvalidPerfEventOption = errors.New("invalid perf event option")
+var (
+	// ErrHardwarePMUUnavailable indicates that the requested hardware event is unsupported.
+	ErrHardwarePMUUnavailable = errors.New("hardware PMU unavailable")
+
+	// ErrInvalidPerfEventOption indicates that perf event options are invalid.
+	ErrInvalidPerfEventOption = errors.New("invalid perf event option")
+)
 
 type perfEventSampleMode uint8
 
@@ -50,20 +58,20 @@ type perfEventOption struct {
 
 func (opt *perfEventOption) Validate() error {
 	if opt == nil {
-		return fmt.Errorf("%w: option required", errInvalidPerfEventOption)
+		return fmt.Errorf("%w: option required", ErrInvalidPerfEventOption)
 	}
 
 	var errs []error
 
 	if opt.program == nil {
 		errs = append(errs, fmt.Errorf(
-			"%w: program required", errInvalidPerfEventOption,
+			"%w: program required", ErrInvalidPerfEventOption,
 		))
 	}
 
 	if opt.sample == 0 {
 		errs = append(errs, fmt.Errorf(
-			"%w: sample value required", errInvalidPerfEventOption,
+			"%w: sample value required", ErrInvalidPerfEventOption,
 		))
 	}
 
@@ -77,6 +85,16 @@ func (opt *perfEventOption) Validate() error {
 func openPerfEvent(attr *unix.PerfEventAttr, progFD, cpuID int) (int, error) {
 	fd, err := unix.PerfEventOpen(attr, -1, cpuID, -1, unix.PERF_FLAG_FD_CLOEXEC)
 	if err != nil {
+		if attr.Type == unix.PERF_TYPE_HARDWARE &&
+			(errors.Is(err, unix.ENOENT) ||
+				errors.Is(err, unix.ENODEV) ||
+				errors.Is(err, unix.EOPNOTSUPP)) {
+			return -1, fmt.Errorf(
+				"%w: open perf event on cpu %d: %w",
+				ErrHardwarePMUUnavailable, cpuID, err,
+			)
+		}
+
 		return -1, fmt.Errorf("open perf event on cpu %d: %w", cpuID, err)
 	}
 
@@ -105,9 +123,10 @@ func attachPerfEvent(opt *perfEventOption) (*perfEventAttach, error) {
 	attr := newPerfEventAttr(opt)
 	cpuIDs := opt.cpuIDs
 	if len(cpuIDs) == 0 {
-		cpuIDs = make([]int, runtime.NumCPU())
-		for cpuID := range cpuIDs {
-			cpuIDs[cpuID] = cpuID
+		var err error
+		cpuIDs, err = onlinePerfCPUs("/sys/devices/system/cpu/online")
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -153,4 +172,36 @@ func closePerfEventFDs(fds []int) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// CPU counts do not describe CPU IDs after hotplug or in sparse VM topologies.
+func onlinePerfCPUs(path string) ([]int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read online perf CPUs: %w", err)
+	}
+	var ids []int
+	previous := -1
+	for _, item := range strings.Split(strings.TrimSpace(string(data)), ",") {
+		firstText, lastText, hasRange := strings.Cut(item, "-")
+		first, err := strconv.Atoi(firstText)
+		if err != nil || first < 0 || first <= previous {
+			return nil, fmt.Errorf("invalid online CPU entry %q", item)
+		}
+		last := first
+		if hasRange {
+			last, err = strconv.Atoi(lastText)
+			if err != nil || last < first {
+				return nil, fmt.Errorf("invalid online CPU range %q", item)
+			}
+		}
+		for cpu := first; ; cpu++ {
+			ids = append(ids, cpu)
+			if cpu == last {
+				break
+			}
+		}
+		previous = last
+	}
+	return ids, nil
 }

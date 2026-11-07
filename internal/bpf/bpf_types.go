@@ -23,6 +23,8 @@ var (
 	ErrClosed = errors.New("bpf: object is closed")
 	// ErrMapNotFound indicates that a requested BPF map is unavailable.
 	ErrMapNotFound = errors.New("bpf: map not found")
+	// ErrVariableNotFound indicates that a requested BPF variable is unavailable.
+	ErrVariableNotFound = errors.New("bpf: variable not found")
 	// ErrDuplicateAttach indicates that a BPF attach target is already in use.
 	ErrDuplicateAttach = errors.New("bpf: duplicate attach")
 )
@@ -35,6 +37,7 @@ type Option struct {
 type AttachOption struct {
 	ProgramName string
 	Symbol      string // symbol for kprobe/kretprobe/tracepoint/raw_tracepoint
+	Optional    bool   // An unavailable hook does not roll back other attachments.
 
 	Kprobe struct {
 		// RetprobeMaxActive limits concurrent kretprobe instances.

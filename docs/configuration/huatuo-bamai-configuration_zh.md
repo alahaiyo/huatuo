@@ -446,7 +446,7 @@ Java 使用 `ToolDir` 下的 `bin/asprof` 和 `lib/libasyncProfiler.so`，Python
 - 仅配置 `Included`：仅监控匹配的容器。
 - 同时配置两者：监控匹配 `Included` 且不匹配 `Excluded` 的容器。
 
-#### 7.2 宿主机系统态 CPU 突增
+#### 7.2 宿主机 CPU 突增
 
 ```toml
 # cpusys
@@ -481,6 +481,10 @@ Java 使用 `ToolDir` 下的 `bin/asprof` 和 `lib/libasyncProfiler.so`，Python
 [AutoTracing.CPUSys]
     # Tool: perf (default) or profiler. Both use RunTracingToolTimeout.
     # Tool = "perf"
+    # UserThreshold = 75
+    # DeltaUserThreshold = 45
+    # UsageThreshold = 90
+    # DeltaUsageThreshold = 55
     # SysThreshold = 45
     # DeltaSysThreshold = 20
     # Interval = 10
@@ -490,13 +494,20 @@ Java 使用 `ToolDir` 下的 `bin/asprof` 和 `lib/libasyncProfiler.so`，Python
 
 | 字段 | 说明 |
 | --- | --- |
+| `UserThreshold` / `DeltaUserThreshold` | 宿主机用户态使用率 / 增量阈值，默认 `75%` / `45` 个百分点。 |
+| `UsageThreshold` / `DeltaUsageThreshold` | 宿主机总执行 CPU 使用率 / 增量阈值，默认 `90%` / `55` 个百分点。 |
 | `SysThreshold` | 宿主机系统态 CPU 使用率阈值，默认 `45%`。 |
 | `DeltaSysThreshold` | 系统态 CPU 使用率相对上次采样的增量阈值，默认 `20` 个百分点。 |
 | `Interval` | 宿主机 CPU 使用率采样间隔，单位秒，默认 `10`。 |
 | `IntervalTracing` | 两次追踪之间的最小间隔，单位秒，默认 `1800`。 |
 | `RunTracingToolTimeout` | 采集时长，单位秒，默认 `10`。 |
 
-**触发条件**：满足追踪间隔后，系统态 CPU 使用率严格大于 `SysThreshold`，且其增量严格大于 `DeltaSysThreshold` 时触发。
+**触发条件**：共用冷却结束后，system/user/total 任一组的使用率及增幅同时严格超过阈值即可触发。
+system 使用上表中的 CPUSys 阈值；user 和 total 分别使用 CPUSys 的
+UserThreshold/DeltaUserThreshold（默认 75/45）和
+UsageThreshold/DeltaUsageThreshold（默认 90/55），与 CPUIdle 独立配置。
+使用率单位为百分比，增幅单位为百分点。三组条件均按阈值严格比较，0 为普通阈值，不表示关闭。
+主机三组条件共用 CPUSys 的采集和冷却，不与容器触发状态共享。
 
 #### 7.3 容器 D 状态负载
 
@@ -790,7 +801,7 @@ SchedBlame 估算所选容器 CPU cgroup 的外部 CPU 竞争。当当前一秒�
   `1..1000`，默认 `100`。
 - **ExternalRatioDebugFile**：可选的 CSV 路径，用于记录每个目标每秒的比例
   诊断数据。默认为空。交互式图表和 SuperMonitor 对比方法见
-  [SchedBlame Analysis](../sched-blame-analysis.md)。
+  [SchedBlame Analysis](../best-practice/sched-blame-analysis_en.md)。
 
 #### 7.9 已知问题标记
 
@@ -1143,7 +1154,7 @@ SchedBlame 估算所选容器 CPU cgroup 的外部 CPU 竞争。当当前一秒�
 #
 # This metric supports host vmstat and cgroup vmstat.
 # - IncludedOnHost / ExcludedOnHost: same as above, for host /proc/vmstat.
-# - IncludedOnContainer / ExcludedOnContainer: same, for cgroup containers memory.stat.
+# - IncludedOnContainer / ExcludedOnContainer: same, for container and sandbox cgroup memory.stat (legacy names).
 #
 [MetricCollector.Vmstat]
     IncludedOnHost = "allocstall|nr_active_anon|nr_active_file|nr_boost_pages|nr_dirty|nr_free_pages|nr_inactive_anon|nr_inactive_file|nr_kswapd_boost|nr_mlock|nr_shmem|nr_slab_reclaimable|nr_slab_unreclaimable|nr_unevictable|nr_writeback|numa_pages_migrated|pgdeactivate|pgrefill|pgscan_direct|pgscan_kswapd|pgsteal_direct|pgsteal_kswapd"
@@ -1155,7 +1166,9 @@ SchedBlame 估算所选容器 CPU cgroup 的外部 CPU 竞争。当当前一秒�
 | 字段 | 说明 |
 | --- | --- |
 | `IncludedOnHost` / `ExcludedOnHost` | 宿主机 `/proc/vmstat` 的字段过滤正则，内置默认值均为 `""`。配置文件显式指定上方纳入列表，并排除匹配 `total` 的字段。 |
-| `IncludedOnContainer` / `ExcludedOnContainer` | 容器 cgroup `memory.stat` 的字段过滤正则，内置默认值均为 `""`。配置文件显式指定上方纳入列表，并排除匹配 `total` 的字段。 |
+| `IncludedOnContainer` / `ExcludedOnContainer` | 容器和沙箱 cgroup `memory.stat` 的字段过滤正则，内置默认值均为 `""`。配置文件显式指定上方纳入列表，并排除匹配 `total` 的字段。 |
+
+`IncludedOnContainer` / `ExcludedOnContainer` 暂时保留旧名称，沙箱复用同一规则，宿主机过滤独立。后续将统一 workload 过滤配置命名与语义，并另行规定旧配置迁移方式；当前不新增别名或改变默认值。
 
 #### 9.6 内存事件
 
@@ -1266,9 +1279,9 @@ SchedBlame 估算所选容器 CPU cgroup 的外部 CPU 竞争。当当前一秒�
 
 以上开关在每次指标采集时读取最新配置；使用 Node API 更新后，下次采集生效。
 
-### 10. Pod 容器信息
+### 10. Workload 发现与容器信息
 
-本节配置从 kubelet 获取 Pod 信息的端口和凭证，用于关联容器与 Pod 标签。
+本节配置 workload 发现来源、Host 同步周期与 kubelet 连接。当前仅支持 `Source = "container"`：Host 查询 kubelet，`Mode = "sandbox"` 保留 Kata Guest 本地扫描和身份配置要求。`cubesandbox`、`opensandbox` 及未知来源暂时拒绝启动。
 
 ```toml
 # Pod Configuration
@@ -1298,14 +1311,24 @@ SchedBlame 估算所选容器 CPU cgroup 的外部 CPU 竞争。当当前一秒�
 # KubeletReadOnlyPort = 0, and KubeletAuthorizedPort = 0.
 #
 [Pod]
+    Source = "container"
+    SyncIntervalSeconds = 30
+    DiscoveryTimeoutSeconds = 10
     KubeletClientCertPath = "/etc/kubernetes/pki/apiserver-kubelet-client.crt,/etc/kubernetes/pki/apiserver-kubelet-client.key"
 ```
 
 | 字段 | 说明 |
 | --- | --- |
+| `Source` | 默认 `"container"`，当前唯一可用来源；只在启动时读取。 |
+| `SyncIntervalSeconds` | Host 全量发现周期，默认 `30` 秒，必须为正整数；不改变指标周期或 Kata Guest 的 5 秒扫描周期。 |
+| `DiscoveryTimeoutSeconds` | 每轮 Host 发现的整体超时，默认 `10` 秒，必须为正整数；Kata Guest 保留原超时。 |
 | `KubeletReadOnlyPort` | kubelet 只读端口，默认 `10255`，通过无认证方式获取 Pod 列表。端口范围为 `1–65535`，设为 `0` 时禁用该方式。 |
 | `KubeletAuthorizedPort` | kubelet HTTPS 端口，默认 `10250`，使用证书认证获取 Pod 信息。端口范围为 `1–65535`，设为 `0` 时禁用该方式。生产环境建议使用此方式。 |
 | `KubeletClientCertPath` | kubelet 客户端证书及私钥路径，内置默认值为 `""`。支持逗号分隔的证书、私钥两条路径，或包含两者的单个 PEM 文件。配置文件显式使用上方 `/etc/kubernetes/pki/` 下的路径，部署时需核对。非 Kubernetes 环境可将两个 kubelet 端口都设为 `0`，禁用 Pod 获取。 |
+
+`Pod.Source`、`Pod.SyncIntervalSeconds` 和 `Pod.DiscoveryTimeoutSeconds` 修改后须重启。运行时配置接口拒绝实际变更，不修改内存配置或磁盘文件。
+
+Host 的两个 kubelet 端口均为 `0` 时仍禁用发现；Kata Guest 不使用这些端口。启用 `GuestBridge` 时必须开启发现，不能同时使用禁用开关或在 Host 关闭两个 kubelet 端口。
 
 ### 11. 命令行参数
 
@@ -1322,7 +1345,8 @@ huatuo-bamai --region <region> [选项]
 | `--bpf-dir` | BPF 对象文件目录 | `bpf` |
 | `--tools-bin-dir` | 追踪工具二进制目录 | `bin` |
 | `--region` | 部署区域（必填） | - |
-| `--disable-kubelet` | 禁用 kubelet Pod 获取 | `false` |
+| `--disable-workload-discovery` | 关闭所选来源和 Guest 本地扫描，不启动 Manager；本机采集继续 | `false` |
+| `--disable-kubelet` | 已废弃，作为 `--disable-workload-discovery` 的兼容别名；在 Guest 中也关闭扫描 | `false` |
 | `--disable-storage` | 禁用存储后端 | `false` |
 | `--enable-cgroup` | 启用自身 cgroup 资源限制（默认关闭） | `false` |
 | `--disable-tracing` | 禁用指定追踪模块（可多次指定） | - |
@@ -1336,7 +1360,7 @@ huatuo-bamai --region <region> [选项]
 
 - **日志级别**：`--log-debug` 强制使用 `Debug`；否则读取 `Log.Level`，未配置时使用 `Info`。
 - **追踪黑名单**：`--disable-tracing` 与配置文件 `BlackList` 合并。
-- **独立开关**：`--disable-kubelet` 和 `--disable-storage` 分别关闭 Pod 同步和存储后端，没有同名 TOML 字段；启用这些开关仍需通过配置文件校验。
+- **独立开关**：`--disable-workload-discovery`（旧别名 `--disable-kubelet`）和 `--disable-storage` 分别关闭 workload 发现和存储后端，没有同名 TOML 字段；启用这些开关仍需通过配置文件校验。
 
 ### 13. 配置建议
 

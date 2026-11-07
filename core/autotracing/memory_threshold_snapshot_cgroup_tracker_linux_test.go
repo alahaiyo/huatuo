@@ -467,6 +467,71 @@ func TestCgroupTrackerEmptyUpdateModes(t *testing.T) {
 	}
 }
 
+func TestCgroupTrackerUnavailableViewRecovery(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		hasRegistration bool
+	}{
+		{name: "initial registration"},
+		{
+			name:            "existing registration",
+			hasRegistration: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tracker, source := newTestCgroupTracker(t)
+			path := "/transient"
+			ref := containerRefForTest(path)
+			createMemoryCgroupForTest(t, source.root, path, 95)
+			if test.hasRegistration {
+				applyContainerEventsForTest(t, tracker, pod.ContainerEvent{
+					Kind:      pod.ContainerCreated,
+					Container: ref,
+				})
+				ref.Key.Generation++
+			}
+
+			previous := tracker.containers[ref.Key.ID]
+			resolve := tracker.directory
+			tracker.directory = func(pod.ContainerRef) (os.FileInfo, error) {
+				return nil, fmt.Errorf("refresh in progress: %w", pod.ErrContainersUnavailable)
+			}
+			applyContainerEventsForTest(t, tracker, pod.ContainerEvent{
+				Kind:      pod.ContainerCreated,
+				Container: ref,
+			})
+			if tracker.containers[ref.Key.ID] != previous {
+				t.Fatal("unavailable view replaced the previous container binding")
+			}
+			if previous != nil && (previous.registrationID == 0 || previous.container.Key == ref.Key) {
+				t.Fatal("unavailable view retired the watch or accepted the new generation")
+			}
+
+			tracker.directory = resolve
+			_, err := tracker.ProcessContainerEvents(t.Context(), pod.ContainerUpdate{
+				Mode:   pod.ContainerUpdateFull,
+				Events: []pod.ContainerEvent{{Container: ref}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			state := tracker.containers[ref.Key.ID]
+			if state == nil || state.registrationID == 0 || state.container != ref {
+				t.Fatal("complete recovered view did not establish the container watch")
+			}
+
+			applyContainerEventsForTest(t, tracker, pod.ContainerEvent{
+				Kind:      pod.ContainerDeleted,
+				Container: ref,
+			})
+			if len(tracker.containers) != 0 || len(tracker.targets) != 0 {
+				t.Fatal("recovered container deletion retained its watch")
+			}
+		})
+	}
+}
+
 func TestCgroupTrackerRegistrationFailureDoesNotRetry(t *testing.T) {
 	tracker, source := newTestCgroupTracker(t)
 	path := "/failed"
@@ -860,6 +925,51 @@ func TestCgroupTrackerRegistrationConflictIsTerminal(t *testing.T) {
 			if len(tracker.targets) != 1 || tracker.targets[id] != owner || owner.container != first ||
 				tracker.containers[second.Key.ID].registrationID != 0 {
 				t.Fatal("conflicting registration overwrote the existing owner")
+			}
+		})
+	}
+}
+
+// TestCgroupTrackerSameGenerationReadiness 验证内存路径和目录延迟就绪后，
+// 同代次全量快照可建立监视；重复快照保留注册与已收到的压力事件，不重复启动任务。
+func TestCgroupTrackerSameGenerationReadiness(t *testing.T) {
+	for _, pending := range []string{"membership", "directory"} {
+		t.Run(pending, func(t *testing.T) {
+			tracker, source := newTestCgroupTracker(t)
+			path := "/checkout-workload"
+			ready := containerRefForTest(path)
+			initial := ready
+			if pending == "membership" {
+				initial.MemoryCgroupPath = ""
+			}
+			if _, err := tracker.ProcessContainerEvents(t.Context(), pod.ContainerUpdate{
+				Mode: pod.ContainerUpdateFull, Events: []pod.ContainerEvent{{Container: initial}},
+			}); err != nil {
+				t.Errorf("publish pending workload: %v", err)
+				return
+			}
+			if len(tracker.targets) != 0 {
+				t.Error("pending workload started a watch")
+			}
+			createMemoryCgroupForTest(t, source.root, path, 95)
+			full := pod.ContainerUpdate{Mode: pod.ContainerUpdateFull, Events: []pod.ContainerEvent{{Container: ready}}}
+			if _, err := tracker.ProcessContainerEvents(t.Context(), full); err != nil {
+				t.Errorf("complete memory binding: %v", err)
+				return
+			}
+			entry := tracker.containers[ready.Key.ID]
+			if entry == nil || entry.registrationID == 0 || entry.container.Key != initial.Key {
+				t.Errorf("same-generation watch was not registered: %+v", entry)
+				return
+			}
+			registration := entry.registrationID
+			if _, err := tracker.ProcessMemoryEvents(t.Context(), []memoryWatchEvent{{Kind: memoryThresholdObserved, TargetID: registration}}, memoryEventOptions{AcceptPending: true}); err != nil {
+				t.Errorf("observe memory pressure: %v", err)
+				return
+			}
+			update, err := tracker.ProcessContainerEvents(t.Context(), full)
+			if err != nil || len(update.Invalidated) != 0 || tracker.containers[ready.Key.ID] != entry || entry.registrationID != registration || tracker.PendingCount() != 1 {
+				t.Errorf("duplicate readiness changed active registration: %+v, %v", update, err)
 			}
 		})
 	}

@@ -571,6 +571,10 @@
           "region": {
             "type": "string"
           },
+          "source_type": {
+            "description": "Observation producer origin (host or kata_guest); omitted for historical documents with unknown origin.",
+            "type": "string"
+          },
           "started_timestamp": {
             "description": "UTC timestamp emitted with nine fractional digits.",
             "format": "date-time",
@@ -1017,7 +1021,7 @@
               }
             }
           },
-          "required": true
+          "description": "All LabelNames fields are optional, so the default protobuf message is empty."
         },
         "responses": {
           "200": {
